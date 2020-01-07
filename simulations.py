@@ -5,27 +5,25 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-
-# use direct autodiff if the ode chain is short:
-# from torchdiffeq import odeint
-
-# use adjoint method if the ode chain is long:
-from torchdiffeq import odeint_adjoint as odeint
-
 from models import LinearODEfunc, SwitchBlock
+
 
 # single particle, deterministic, 2D, switch between two ODE models
 class SwitchDataset(Dataset):
     def __init__(self, *args):
-        # TODO:
-        device, time_span, sample_size, dt = args
+        device, time_span, sample_size, dt, rtol, atol = args
         self.time_span = time_span  # time span
         self.sample_size = sample_size
-        self.x0 = np.random.random((sample_size, 4))  # initial state in 2D space (speed and velocity)
-        self.dt = dt
 
-        A1 = [[1., 0., 1., 0.], [0., 1., 0., 1.], [0., 0., 1., 0.], [0., 0., 0., 1.]]
-        A2 = [[1., 0., 1., 0.], [0., 1., 0., 1.], [0., 0., 0.8, 0.2], [0., 0., 0.2, 0.8]]
+        # initial state in 2D space (speed and velocity)
+        self.x0 = torch.tensor(np.random.uniform(low=0., high=1., size=(sample_size, 2)))
+        self.dt = dt
+        self.domain = [[0., 1.], [0., 1.]]
+        # TODO: need to rescale x0 if domain is not [0,1]
+
+        # define two odes
+        A1 = [[-1., 1], [0.2, -1.]]  # moving at constant speed
+        A2 = [[-0.2, -1.], [-1., 1.]]
         odefunc1 = LinearODEfunc(A1)
         odefunc2 = LinearODEfunc(A2)
         domain1 = [[0., 0.5], [0., 1.]]  # [[xmin, xmax], [ymin, ymax]]
@@ -36,9 +34,12 @@ class SwitchDataset(Dataset):
                     'domain2': domain2,
                     'time_span': time_span,
                     'dt': dt,
-                    'device': device}
+                    'device': device,
+                    'rtol': rtol,
+                    'atol': atol}
         model = SwitchBlock(settings)
-        self.X = model.simulate(self.x0, dt)
+        # X is the trajectory, phase is the ode model ID (0 or 1)
+        self.X, self.phase = model.simulate(self.x0, dt)
 
     def __len__(self):
         return len(self.sample_size)
@@ -47,14 +48,5 @@ class SwitchDataset(Dataset):
         return self.X[idx]
 
 
-def get_data_loaders(batch_size=128, test_batch_size=128):
 
-    trj_data = SwitchDataset(test_batch_size)
 
-    train_loader = DataLoader(dataset=trj_data, batch_size=batch_size, shuffle=False)
-
-    train_eval_loader = DataLoader(dataset=trj_data, batch_size=test_batch_size, shuffle=False)
-
-    test_loader = DataLoader(dataset=trj_data, batch_size=test_batch_size, shuffle=False)
-
-    return train_loader, test_loader, train_eval_loader

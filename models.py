@@ -55,35 +55,44 @@ class SwitchBlock(nn.Module):
     def __init__(self, settings):
         super(SwitchBlock, self).__init__()
         self.odefunc1 = settings['odefunc1']
-        self.odefunc2 = settings['odefunc1']
+        self.odefunc2 = settings['odefunc2']
         self.domain1 = settings['domain1']
         self.domain2 = settings['domain2']
         self.device = settings['device']
+        self.rtol = settings['rtol']
+        self.atol = settings['atol']
+
 
     def forward(self, x):
-        # TODO: develop the differentiable forward model
+        # TODO: develop a differentiable forward model
 
         return
 
     def step(self, x, dt):
         integration_time = torch.tensor([0, dt]).float()
-
-        if x[1] <= 0.5: # TODO: write attribution code
-            x_new = odeint(self.odefunc1, x, integration_time, rtol=self.rtol, atol=self.atol)[1].cpu().detach().numpy()
-        else:
-            x_new = odeint(self.odefunc2, x, integration_time, rtol=self.rtol, atol=self.atol)[1].cpu().detach().numpy()
-
-        return x_new
+        ind = self.region(x)
+        if x[ind].shape[0] > 0:   # if not empty
+            x[ind] = odeint(self.odefunc1, x[ind], integration_time, rtol=self.rtol, atol=self.atol)[1]
+        ind = -ind + 1  # flip indices
+        if x[ind].shape[0] > 0:  # if not empty
+            x[ind] = odeint(self.odefunc2, x[ind], integration_time, rtol=self.rtol, atol=self.atol)[1]
+        return x.cpu().detach().numpy(), ind.cpu().detach().numpy()  # TODO: check if return value or graph
 
     def simulate(self, x, dt):
         out_seq = np.expand_dims(x.cpu().detach().numpy(), axis=2)
+        out_ind_seq = self.region(x).cpu().detach().numpy()
         n_step = int(1. / dt)
         for i in range(n_step):
-            x_new = self.step(x, dt)
-            x = torch.tensor(x_new).to(self.device).float()
+            x_new, ind = self.step(x, dt)
+            x = torch.tensor(x_new).to(self.device)
             x_new = np.expand_dims(x_new, axis=2)  # add time as the 3rd dimension
             out_seq = np.concatenate((out_seq, x_new), axis=2)  # dim 1: batch, dim 2: state dim, dim 3: time
-        return out_seq
+            out_ind_seq = np.vstack((out_ind_seq, ind))  # to be transposed to: dim 1: batch, dim 2: time
+        return out_seq, out_ind_seq.T
+
+    @staticmethod
+    def region(x):
+        return x[:, 0] < 0.5  # TODO: formalize this
 
     @property
     def nfe(self):
@@ -100,18 +109,19 @@ class LinearODEfunc(nn.Module):
     # TODO: odeint with control inputs?
     def __init__(self, A):
         super(LinearODEfunc, self).__init__()
-        self.A = torch.tensor(A)
+        self.A = torch.tensor(A).float()  # first dim is batch, need float for matrix mul
         self.nfe = 0
 
-    def forward(self, x):
+    def forward(self, t, x):
         self.nfe += 1
-        out = torch.mm(self.A, x)
-        return out
+        out = torch.mm(self.A, torch.transpose(x.float(), 0, 1))
+        return torch.transpose(out, 0, 1).double()
 
 
 # define NN model to mimic ODE
 class NODEfunc(nn.Module):
 
+    # this model can be customized
     def __init__(self, dim):
         super(NODEfunc, self).__init__()
         self.linear1 = nn.Linear(dim, 16)
