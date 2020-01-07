@@ -16,6 +16,7 @@ class SwitchDataset(Dataset):
         self.sample_size = sample_size
 
         # initial state in 2D space (speed and velocity)
+        np.random.seed(0)
         self.x0 = torch.tensor(np.random.uniform(low=0., high=1., size=(sample_size, 2)))
         self.dt = dt
         self.domain = [[0., 1.], [0., 1.]]
@@ -41,8 +42,11 @@ class SwitchDataset(Dataset):
         # X is the trajectory, phase is the ode model ID (0 or 1)
         self.X, self.phase = model.simulate(self.x0, dt)
 
+    def dim(self):
+        return self.X.shape[1], self.X.shape[2]  # dim of the state space, time step
+
     def __len__(self):
-        return len(self.sample_size)
+        return self.sample_size
 
     def __getitem__(self, idx):
         return self.X[idx]

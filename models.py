@@ -14,16 +14,25 @@ from torchdiffeq import odeint_adjoint as odeint
 # this is the ODE block
 class ODEBlock(nn.Module):
 
-    def __init__(self, odefunc, device):
+    def __init__(self, settings):
         super(ODEBlock, self).__init__()
-        self.odefunc = odefunc
+        self.odefunc = settings['odefunc']
+        self.device = settings['device']
+        self.rtol = settings['rtol']
+        self.atol = settings['atol']
         self.integration_time = torch.tensor([0, 1]).float()
-        self.device = device
 
-    def forward(self, x):
-        self.integration_time = self.integration_time.type_as(x)
-        out = odeint(self.odefunc, x, self.integration_time, rtol=self.rtol, atol=self.atol)
-        return out[1]
+    def forward(self, x, dt):
+        # need to treat all intermediate ode steps as part of the graph
+        batch_size, dim = x.shape
+        out_seq = torch.empty(batch_size, dim, 0)
+        n_step = int(1. / dt)
+        integration_time = torch.tensor([0, dt]).float()
+        for i in range(n_step):
+            x_new = odeint(self.odefunc, x, integration_time, rtol=self.rtol, atol=self.atol)[1]
+            x = x_new
+            out_seq = torch.cat((out_seq, x_new.unsqueeze(-1)), 2)  # dim 1: batch, dim 2: state dim, dim 3: time
+        return out_seq
 
     def step(self, x, dt):
         integration_time = torch.tensor([0, dt]).float()
