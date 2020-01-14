@@ -82,7 +82,7 @@ class SwitchBlock(nn.Module):
         ind = self.region(x)
         if x[ind].shape[0] > 0:   # if not empty
             x[ind] = odeint(self.odefunc1, x[ind], integration_time, rtol=self.rtol, atol=self.atol)[1]
-        ind = -ind + 1  # flip indices
+        ind = torch.logical_not(ind) + 1  # flip indices
         if x[ind].shape[0] > 0:  # if not empty
             x[ind] = odeint(self.odefunc2, x[ind], integration_time, rtol=self.rtol, atol=self.atol)[1]
         return x.cpu().detach().numpy(), ind.cpu().detach().numpy()  # TODO: check if return value or graph

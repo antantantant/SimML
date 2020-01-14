@@ -14,6 +14,7 @@ from simulations import SwitchDataset
 import matplotlib
 matplotlib.use("TkAgg")
 from models import NODEfunc, ODEBlock
+torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--physics', type=str, choices=['switch'], default='switch')  # choose physics model
@@ -37,6 +38,7 @@ if __name__ == '__main__':
     utils.makedirs(args.save)
     logger = utils.get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
     logger.info(args)
+
     device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
 
     # visualize the model
