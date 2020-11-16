@@ -1,3 +1,5 @@
+# TODO: update NODE fw to current version (using version from 1/2020)
+
 import setuptools
 
 setuptools.setup(

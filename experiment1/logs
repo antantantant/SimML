@@ -5463,3 +5463,535 @@ if __name__ == '__main__':
     vis.compare_data()
 
 Namespace(adjoint=True, batch_size=20, debug=False, dt=0.001, gpu=0, lr=0.1, nepochs=100, network='odenet', physics='switch', save='./experiment1', test_batch_size=20, time_span=1.0, tol=0.001)
+C:\Users\harsh\PycharmProjects\SimML\experiment.py
+# TODO: develop and validate models for these cases
+# TODO: visualize 2d data on toy cases (stochastic, hybrid)
+# TODO: develop and validate models for these cases
+
+import os
+import argparse
+import time
+import numpy as np
+import torch
+from torch import nn
+import utils
+from utils import RunningAverageMeter, accuracy
+from simulations import SwitchDataset
+import matplotlib
+matplotlib.use("TkAgg")
+from models import NODEfunc, ODEBlock
+torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--physics', type=str, choices=['switch'], default='switch')  # choose physics model
+parser.add_argument('--time_span', type=float, default=1.)  # time span for simulation
+parser.add_argument('--dt', type=float, default=0.001)  # time step for simulation
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')  # choose surrogate model
+parser.add_argument('--tol', type=float, default=1e-3)  # tolerance for ode solver
+parser.add_argument('--adjoint', type=eval, default=True, choices=[True, False])  # method for computing gradient
+parser.add_argument('--nepochs', type=int, default=100)  # number of training epochs
+parser.add_argument('--lr', type=float, default=0.1)  # learning rate
+parser.add_argument('--batch_size', type=int, default=20)  # batch size for training
+parser.add_argument('--test_batch_size', type=int, default=20)  # batch size for validation and test
+parser.add_argument('--save', type=str, default='./experiment1')  # save dir
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+
+if __name__ == '__main__':
+
+    utils.makedirs(args.save)
+    logger = utils.get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    # visualize the model
+    def create_dataset(model_type):
+        # create simulation dataset
+        return {
+            # add new models here
+            'switch': SwitchDataset(device, args.time_span, args.test_batch_size, args.dt, args.tol, args.tol)
+        }[model_type]
+
+    physics_simulation = create_dataset(args.physics)
+    # vis = utils.Visualization(dataset=physics_simulation)
+    # vis.plot_data()
+
+    # train a baseline Neural ODE model
+    # NOTE: please distinguish between physical and surrogate (statistical) models
+    settings = {'odefunc': NODEfunc(2),
+                'device': device,
+                'rtol': args.tol,
+                'atol': args.tol}
+    surrogate_model = ODEBlock(settings).to(device)
+
+    # save model info
+    logger.info(surrogate_model)
+    logger.info('Number of parameters: {}'.format(utils.count_parameters(surrogate_model)))
+
+    # define loss
+    criterion = nn.MSELoss().to(device)  # TODO: check loss definition
+
+    # get data streamer
+    train_loader, test_loader, train_eval_loader = utils.get_data_loaders(physics_simulation, args.batch_size, args.test_batch_size)
+    data_gen = utils.inf_generator(train_loader)
+    batches_per_epoch = int(args.test_batch_size / args.batch_size)
+
+    # training process
+#####################################################################
+    # TODO: need to fine-tune the learning rate scheme?
+    lr_fn = utils.learning_rate_with_decay(
+        args.lr, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    # set up the optimizer
+    optimizer = torch.optim.SGD(surrogate_model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = utils.RunningAverageMeter()
+    f_nfe_meter = utils.RunningAverageMeter()
+    b_nfe_meter = utils.RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x = data_gen.__next__()
+        x0 = x[:,:,0]  # get the initial states
+        x0 = x0.to(device)
+        pred = surrogate_model(x0.float(), args.dt)  # output is batch_size * dim * time, excluding the initial state
+        # compute MSE between physical and surrogate model
+        loss = criterion(pred, x[:,:,1:].float())  # exclude initial states since they are the same for pred and target
+
+        # monitor forward ODE steps
+        nfe_forward = surrogate_model.nfe
+        surrogate_model.nfe = 0
+
+        # compute gradient and do gradient descent
+        loss.backward()
+        optimizer.step()
+
+        # monitor adjoint steps
+        nfe_backward = surrogate_model.nfe
+        surrogate_model.nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(surrogate_model, args.dt, criterion, train_eval_loader, device)
+                val_acc = accuracy(surrogate_model, args.dt, criterion, test_loader, device)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': surrogate_model.state_dict(), 'args': args},
+                               os.path.join(args.save, 'surrogate_model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Err {:.4f} | Test Err {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+#####################################################################
+
+    # visualize surrogate model along with the physics simulation
+
+    # # TODO: load the model if pre-trained
+    # surrogate_model.load_state_dict(torch.load(os.path.join(args.save, 'surrogate_model.pth'))['state_dict'],
+    #                                 strict=False)
+    # surrogate_model.eval()
+
+    dim, time_step = physics_simulation.dim()
+    predict = np.empty((0, dim, time_step))
+    for x in test_loader:
+        target = x[:,:,1:].to(device).float()
+        x0 = x[:,:,0].to(device)
+        x = surrogate_model(x0.float(), args.dt).cpu().detach().numpy()
+        x0 = np.expand_dims(x0.cpu().detach().numpy(), axis=2)
+        x = np.concatenate((x0, x), axis=2)  # add the initial state back in
+        predict = np.concatenate((predict, x), axis=0)
+
+    vis = utils.Visualization(dataset=[physics_simulation, predict])
+    vis.compare_data()
+
+Namespace(adjoint=True, batch_size=20, debug=False, dt=0.001, gpu=0, lr=0.1, nepochs=100, network='odenet', physics='switch', save='./experiment1', test_batch_size=20, time_span=1.0, tol=0.001)
+ODEBlock(
+  (odefunc): NODEfunc(
+    (linear1): Linear(in_features=2, out_features=16, bias=True)
+    (linear2): Linear(in_features=16, out_features=32, bias=True)
+    (linear3): Linear(in_features=32, out_features=2, bias=True)
+    (relu): ReLU(inplace=True)
+  )
+)
+Number of parameters: 658
+C:\Users\harsh\PycharmProjects\SimML\experiment.py
+# TODO: develop and validate models for these cases
+# TODO: visualize 2d data on toy cases (stochastic, hybrid)
+# TODO: develop and validate models for these cases
+
+import os
+import argparse
+import time
+import numpy as np
+import torch
+from torch import nn
+import utils
+from utils import RunningAverageMeter, accuracy
+from simulations import SwitchDataset
+import matplotlib
+matplotlib.use("TkAgg")
+from models import NODEfunc, ODEBlock
+torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--physics', type=str, choices=['switch'], default='switch')  # choose physics model
+parser.add_argument('--time_span', type=float, default=1.)  # time span for simulation
+parser.add_argument('--dt', type=float, default=0.001)  # time step for simulation
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')  # choose surrogate model
+parser.add_argument('--tol', type=float, default=1e-3)  # tolerance for ode solver
+parser.add_argument('--adjoint', type=eval, default=True, choices=[True, False])  # method for computing gradient
+parser.add_argument('--nepochs', type=int, default=100)  # number of training epochs
+parser.add_argument('--lr', type=float, default=0.1)  # learning rate
+parser.add_argument('--batch_size', type=int, default=20)  # batch size for training
+parser.add_argument('--test_batch_size', type=int, default=20)  # batch size for validation and test
+parser.add_argument('--save', type=str, default='./experiment1')  # save dir
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+
+if __name__ == '__main__':
+
+    utils.makedirs(args.save)
+    logger = utils.get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    # visualize the model
+    def create_dataset(model_type):
+        # create simulation dataset
+        return {
+            # add new models here
+            'switch': SwitchDataset(device, args.time_span, args.test_batch_size, args.dt, args.tol, args.tol)
+        }[model_type]
+
+    physics_simulation = create_dataset(args.physics)
+    # vis = utils.Visualization(dataset=physics_simulation)
+    # vis.plot_data()
+
+    # train a baseline Neural ODE model
+    # NOTE: please distinguish between physical and surrogate (statistical) models
+    settings = {'odefunc': NODEfunc(2),
+                'device': device,
+                'rtol': args.tol,
+                'atol': args.tol}
+    surrogate_model = ODEBlock(settings).to(device)
+
+    # save model info
+    logger.info(surrogate_model)
+    logger.info('Number of parameters: {}'.format(utils.count_parameters(surrogate_model)))
+
+    # define loss
+    criterion = nn.MSELoss().to(device)  # TODO: check loss definition
+
+    # get data streamer
+    train_loader, test_loader, train_eval_loader = utils.get_data_loaders(physics_simulation, args.batch_size, args.test_batch_size)
+    data_gen = utils.inf_generator(train_loader)
+    batches_per_epoch = int(args.test_batch_size / args.batch_size)
+
+    # training process
+#####################################################################
+    # TODO: need to fine-tune the learning rate scheme?
+    lr_fn = utils.learning_rate_with_decay(
+        args.lr, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    # set up the optimizer
+    optimizer = torch.optim.SGD(surrogate_model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = utils.RunningAverageMeter()
+    f_nfe_meter = utils.RunningAverageMeter()
+    b_nfe_meter = utils.RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x = data_gen.__next__()
+        x0 = x[:,:,0]  # get the initial states
+        x0 = x0.to(device)
+        pred = surrogate_model(x0.float(), args.dt)  # output is batch_size * dim * time, excluding the initial state
+        # compute MSE between physical and surrogate model
+        loss = criterion(pred, x[:,:,1:].float())  # exclude initial states since they are the same for pred and target
+
+        # monitor forward ODE steps
+        nfe_forward = surrogate_model.nfe
+        surrogate_model.nfe = 0
+
+        # compute gradient and do gradient descent
+        loss.backward()
+        optimizer.step()
+
+        # monitor adjoint steps
+        nfe_backward = surrogate_model.nfe
+        surrogate_model.nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(surrogate_model, args.dt, criterion, train_eval_loader, device)
+                val_acc = accuracy(surrogate_model, args.dt, criterion, test_loader, device)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': surrogate_model.state_dict(), 'args': args},
+                               os.path.join(args.save, 'surrogate_model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Err {:.4f} | Test Err {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+#####################################################################
+
+    # visualize surrogate model along with the physics simulation
+
+    # # TODO: load the model if pre-trained
+    # surrogate_model.load_state_dict(torch.load(os.path.join(args.save, 'surrogate_model.pth'))['state_dict'],
+    #                                 strict=False)
+    # surrogate_model.eval()
+
+    dim, time_step = physics_simulation.dim()
+    predict = np.empty((0, dim, time_step))
+    for x in test_loader:
+        target = x[:,:,1:].to(device).float()
+        x0 = x[:,:,0].to(device)
+        x = surrogate_model(x0.float(), args.dt).cpu().detach().numpy()
+        x0 = np.expand_dims(x0.cpu().detach().numpy(), axis=2)
+        x = np.concatenate((x0, x), axis=2)  # add the initial state back in
+        predict = np.concatenate((predict, x), axis=0)
+
+    vis = utils.Visualization(dataset=[physics_simulation, predict])
+    vis.compare_data()
+
+Namespace(adjoint=True, batch_size=20, debug=False, dt=0.001, gpu=0, lr=0.1, nepochs=100, network='odenet', physics='switch', save='./experiment1', test_batch_size=20, time_span=1.0, tol=0.001)
+ODEBlock(
+  (odefunc): NODEfunc(
+    (linear1): Linear(in_features=2, out_features=16, bias=True)
+    (linear2): Linear(in_features=16, out_features=32, bias=True)
+    (linear3): Linear(in_features=32, out_features=2, bias=True)
+    (relu): ReLU(inplace=True)
+  )
+)
+Number of parameters: 658
+Epoch 0000 | Time 81.464 (81.464) | NFE-F 8000.0 | NFE-B 9000.0 | Train Err 0.0014 | Test Err 0.0014
+Epoch 0001 | Time 114.500 (81.795) | NFE-F 8160.0 | NFE-B 9000.0 | Train Err 0.0012 | Test Err 0.0012
+Epoch 0002 | Time 126.506 (82.242) | NFE-F 8318.4 | NFE-B 9000.0 | Train Err 0.0010 | Test Err 0.0010
+Epoch 0003 | Time 121.141 (82.631) | NFE-F 8475.2 | NFE-B 9000.0 | Train Err 0.0008 | Test Err 0.0008
+Epoch 0004 | Time 115.058 (82.955) | NFE-F 8630.5 | NFE-B 9000.0 | Train Err 0.0008 | Test Err 0.0008
+Epoch 0005 | Time 113.827 (83.264) | NFE-F 8784.2 | NFE-B 9000.0 | Train Err 0.0008 | Test Err 0.0008
+Epoch 0006 | Time 117.349 (83.605) | NFE-F 8936.3 | NFE-B 9000.0 | Train Err 0.0008 | Test Err 0.0008
+Epoch 0007 | Time 114.885 (83.918) | NFE-F 9087.0 | NFE-B 9000.0 | Train Err 0.0009 | Test Err 0.0009
+C:\Users\harsh\PycharmProjects\SimML\experiment.py
+# TODO: develop and validate models for these cases
+# TODO: visualize 2d data on toy cases (stochastic, hybrid)
+# TODO: develop and validate models for these cases
+
+import os
+import argparse
+import time
+import numpy as np
+import torch
+from torch import nn
+import utils
+from utils import RunningAverageMeter, accuracy
+from simulations import SwitchDataset
+import matplotlib
+matplotlib.use("TkAgg")
+from models import NODEfunc, ODEBlock
+torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--physics', type=str, choices=['switch'], default='switch')  # choose physics model
+parser.add_argument('--time_span', type=float, default=1.)  # time span for simulation
+parser.add_argument('--dt', type=float, default=0.001)  # time step for simulation
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')  # choose surrogate model
+parser.add_argument('--tol', type=float, default=1e-3)  # tolerance for ode solver
+parser.add_argument('--adjoint', type=eval, default=True, choices=[True, False])  # method for computing gradient
+parser.add_argument('--nepochs', type=int, default=8)  # number of training epochs; default = 100
+parser.add_argument('--lr', type=float, default=0.1)  # learning rate
+parser.add_argument('--batch_size', type=int, default=40)  # batch size for training
+parser.add_argument('--test_batch_size', type=int, default=40)  # batch size for validation and test
+parser.add_argument('--save', type=str, default='./experiment1')  # save dir
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+
+if __name__ == '__main__':
+
+    utils.makedirs(args.save)
+    logger = utils.get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    # visualize the model
+    def create_dataset(model_type):
+        # create simulation dataset
+        return {
+            # add new models here
+            'switch': SwitchDataset(device, args.time_span, args.test_batch_size, args.dt, args.tol, args.tol)
+        }[model_type]
+
+    physics_simulation = create_dataset(args.physics)
+    # vis = utils.Visualization(dataset=physics_simulation)
+    # vis.plot_data()
+
+    # train a baseline Neural ODE model
+    # NOTE: please distinguish between physical and surrogate (statistical) models
+    settings = {'odefunc': NODEfunc(2),
+                'device': device,
+                'rtol': args.tol,
+                'atol': args.tol}
+    surrogate_model = ODEBlock(settings).to(device)
+
+    # save model info
+    logger.info(surrogate_model)
+    logger.info('Number of parameters: {}'.format(utils.count_parameters(surrogate_model)))
+
+    # define loss
+    criterion = nn.MSELoss().to(device)  # TODO: check loss definition
+
+    # get data streamer
+    train_loader, test_loader, train_eval_loader = utils.get_data_loaders(physics_simulation, args.batch_size, args.test_batch_size)
+    data_gen = utils.inf_generator(train_loader)
+    batches_per_epoch = int(args.test_batch_size / args.batch_size)
+
+    # training process
+#####################################################################
+    # TODO: need to fine-tune the learning rate scheme?
+    lr_fn = utils.learning_rate_with_decay(
+        args.lr, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    # set up the optimizer
+    optimizer = torch.optim.SGD(surrogate_model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = utils.RunningAverageMeter()
+    f_nfe_meter = utils.RunningAverageMeter()
+    b_nfe_meter = utils.RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x = data_gen.__next__()
+        x0 = x[:,:,0]  # get the initial states
+        x0 = x0.to(device)
+        pred = surrogate_model(x0.float(), args.dt)  # output is batch_size * dim * time, excluding the initial state
+        # compute MSE between physical and surrogate model
+        loss = criterion(pred, x[:,:,1:].float())  # exclude initial states since they are the same for pred and target
+
+        # monitor forward ODE steps
+        nfe_forward = surrogate_model.nfe
+        surrogate_model.nfe = 0
+
+        # compute gradient and do gradient descent
+        loss.backward()
+        optimizer.step()
+
+        # monitor adjoint steps
+        nfe_backward = surrogate_model.nfe
+        surrogate_model.nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(surrogate_model, args.dt, criterion, train_eval_loader, device)
+                val_acc = accuracy(surrogate_model, args.dt, criterion, test_loader, device)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': surrogate_model.state_dict(), 'args': args},
+                               os.path.join(args.save, 'surrogate_model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Err {:.4f} | Test Err {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+#####################################################################
+
+    # visualize surrogate model along with the physics simulation
+
+    # # TODO: load the model if pre-trained
+    # surrogate_model.load_state_dict(torch.load(os.path.join(args.save, 'surrogate_model.pth'))['state_dict'],
+    #                                 strict=False)
+    # surrogate_model.eval()
+
+    dim, time_step = physics_simulation.dim()
+    predict = np.empty((0, dim, time_step))
+    for x in test_loader:
+        target = x[:,:,1:].to(device).float()
+        x0 = x[:,:,0].to(device)
+        x = surrogate_model(x0.float(), args.dt).cpu().detach().numpy()
+        x0 = np.expand_dims(x0.cpu().detach().numpy(), axis=2)
+        x = np.concatenate((x0, x), axis=2)  # add the initial state back in
+        predict = np.concatenate((predict, x), axis=0)
+
+    vis = utils.Visualization(dataset=[physics_simulation, predict])
+    vis.compare_data()
+
+Namespace(adjoint=True, batch_size=40, debug=False, dt=0.001, gpu=0, lr=0.1, nepochs=8, network='odenet', physics='switch', save='./experiment1', test_batch_size=40, time_span=1.0, tol=0.001)
+ODEBlock(
+  (odefunc): NODEfunc(
+    (linear1): Linear(in_features=2, out_features=16, bias=True)
+    (linear2): Linear(in_features=16, out_features=32, bias=True)
+    (linear3): Linear(in_features=32, out_features=2, bias=True)
+    (relu): ReLU(inplace=True)
+  )
+)
+Number of parameters: 658
+Epoch 0000 | Time 84.166 (84.166) | NFE-F 8000.0 | NFE-B 9000.0 | Train Err 0.0003 | Test Err 0.0003
+Epoch 0001 | Time 119.298 (84.517) | NFE-F 8160.0 | NFE-B 9000.0 | Train Err 0.0003 | Test Err 0.0003
+Epoch 0002 | Time 122.667 (84.899) | NFE-F 8318.4 | NFE-B 9000.0 | Train Err 0.0003 | Test Err 0.0003
+Epoch 0003 | Time 121.382 (85.264) | NFE-F 8475.2 | NFE-B 9000.0 | Train Err 0.0002 | Test Err 0.0002
+Epoch 0004 | Time 128.438 (85.695) | NFE-F 8630.5 | NFE-B 9000.0 | Train Err 0.0002 | Test Err 0.0002
+Epoch 0005 | Time 118.461 (86.023) | NFE-F 8784.2 | NFE-B 9000.0 | Train Err 0.0002 | Test Err 0.0002
+Epoch 0006 | Time 117.136 (86.334) | NFE-F 8936.3 | NFE-B 9000.0 | Train Err 0.0002 | Test Err 0.0002
+Epoch 0007 | Time 122.282 (86.694) | NFE-F 9087.0 | NFE-B 9000.0 | Train Err 0.0002 | Test Err 0.0002
